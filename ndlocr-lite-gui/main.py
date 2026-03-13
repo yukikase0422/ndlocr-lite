@@ -372,9 +372,10 @@ class ImageSelector:
         for det in detections:
             xmin,ymin,xmax,ymax=det["box"]
             conf=det["confidence"]
+            char_count=det["pred_char_count"]
             if det["class_index"]==0:
                 resultobj[0][0].append([xmin,ymin,xmax,ymax])
-            resultobj[1][det["class_index"]].append([xmin,ymin,xmax,ymax,conf])
+            resultobj[1][det["class_index"]].append([xmin,ymin,xmax,ymax,conf,char_count])
         xmlstr=convert_to_xml_string3(img_w, img_h, inputname, classeslist, resultobj)
         xmlstr="<OCRDATASET>"+xmlstr+"</OCRDATASET>"
 
@@ -733,11 +734,12 @@ class CaptureTool:
                 resultobj[1][i] = []
                 
             for det in detections:
-                xmin, ymin, xmax, ymax = det["box"]
-                conf = det["confidence"]
-                if det["class_index"] == 0:
-                    resultobj[0][0].append([xmin, ymin, xmax, ymax])
-                resultobj[1][det["class_index"]].append([xmin, ymin, xmax, ymax, conf])
+                xmin,ymin,xmax,ymax=det["box"]
+                conf=det["confidence"]
+                char_count=det["pred_char_count"]
+                if det["class_index"]==0:
+                    resultobj[0][0].append([xmin,ymin,xmax,ymax])
+                resultobj[1][det["class_index"]].append([xmin,ymin,xmax,ymax,conf,char_count])
 
             xmlstr = convert_to_xml_string3(
                 img_w, img_h, filename_base, classeslist, resultobj)
