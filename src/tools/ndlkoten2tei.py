@@ -26,7 +26,7 @@ xmltemplate="""<?xml version="1.0" encoding="UTF-8"?>
             <title>Title</title>
             <respStmt>
                <resp>Automated Transcription</resp>
-               <name ref="https://github.com/ndl-lab/ndlkotenocr-lite">NDL古典籍OCR-Liteアプリケーション</name>
+               <name ref="https://github.com/ndl-lab/ndlocr-lite">NDLOCR-Liteアプリケーション</name>
             </respStmt>
             <respStmt><resp>Conversion to TEI encoding</resp>
                <name>Kiyonori Nagasaki</name>
