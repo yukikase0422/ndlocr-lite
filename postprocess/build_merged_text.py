@@ -1,12 +1,16 @@
-"""NDLOCR出力XMLから検索用統合テキスト・ページ索引・閲覧用テキストを生成する。
+"""PDF / 画像からNDLOCR実行→後処理まで一貫して行うオーケストレーター。
 
-生成ファイル (出力ディレクトリ直下に配置):
-  - ``<prefix>.ndlocr-body.txt``     検索専用本文
-  - ``<prefix>.ndlocr-index.json``   バイトオフセット→ページ番号索引
-  - ``<prefix>.ndlocr-indexed.txt``  人間閲覧用（ページ/章マーカー入り）
+入力種別:
+  - PDF: pypdfium2で画像化し ``{stem}_NDLOCR/page_XXX.png`` に配置 → NDLOCR実行 → 後処理
+  - 単一画像: ``{stem}_NDLOCR/`` を作成し ``page_001.png`` にリネーム配置 → NDLOCR実行 → 後処理
+  - 画像フォルダ: フォルダ内各画像を独立処理 + オプションで全体結合
+  - 複数ファイル引数: 各ファイルを独立処理（上記の繰り返し）
 
-``.ndlocr-*`` サフィックスはNDLOCR後処理結果の一意な識別子として機能し、
-Claude Code等のツールが当該ファイルを自動判別する際に利用する。
+出力ファイル命名規則:
+  - ``{stem}_NDLOCR結果（本文のみ結合済）.txt`` — 検索用本文（改行除去・ページ跨ぎ連結）
+  - ``{stem}_NDLOCR結果（閲覧用ページ番号付き）.txt`` — ``<page number="N">...</page>`` 形式
+  - ``{stem}_NDLOCR結果（ページ索引）.json`` — バイトオフセット→ページ番号
+  - ``{stem}_NDLOCR/`` — 中間物ディレクトリ（page_XXX.png/txt/xml/json）
 
 Issue: https://github.com/yukikase0422/ndlocr-lite/issues/1
       https://github.com/yukikase0422/ndlocr-lite/issues/2
@@ -17,13 +21,25 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
+
+# Windows の cp932 環境でも UTF-8 で安全に出力できるようにする
+for _stream in (sys.stdout, sys.stderr):
+    reconf = getattr(_stream, "reconfigure", None)
+    if callable(reconf):
+        try:
+            reconf(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 PAGE_FILE_RE = re.compile(r"page_(\d+)\.xml$", re.IGNORECASE)
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp"}
 
 TYPE_BODY = "本文"
 TYPE_TITLE = "タイトル本文"
@@ -44,24 +60,93 @@ def iter_lines_in_reading_order(xml_path: Path) -> Iterable[tuple[str, str]]:
         yield ltype, text
 
 
-def build(
-    ocr_dir: Path,
-    out_dir: Path,
-    prefix: str,
+def calculate_zero_padding(total_pages: int) -> int:
+    """全ページ数に基づいてゼロ埋め桁数を計算する。"""
+    if total_pages <= 0:
+        return 3
+    return max(3, len(str(total_pages)))
+
+
+def pdf_to_images(pdf_path: Path, output_dir: Path, dpi: int = 300) -> list[Path]:
+    """PDFを画像に変換し、output_dir内にpage_XXX.pngとして保存する。"""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        sys.exit("エラー: pypdfium2がインストールされていません。`pip install pypdfium2` を実行してください。")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    pdf = pdfium.PdfDocument(str(pdf_path))
+    total_pages = len(pdf)
+    zero_pad = calculate_zero_padding(total_pages)
+
+    image_paths: list[Path] = []
+    scale = dpi / 72  # 72 DPI is the default PDF unit
+
+    for i, page in enumerate(pdf):
+        page_num = i + 1
+        bitmap = page.render(scale=scale)
+        pil_image = bitmap.to_pil()
+        output_path = output_dir / f"page_{page_num:0{zero_pad}d}.png"
+        pil_image.save(str(output_path), "PNG")
+        image_paths.append(output_path)
+        page.close()
+
+    pdf.close()
+    print(f"[INFO] PDF画像化完了: {total_pages}ページ → {output_dir}")
+    return image_paths
+
+
+def run_ndlocr(ndlocr_dir: Path) -> bool:
+    """NDLOCRを実行する。ndlocr_dir内のpage_XXX.pngを処理する。"""
+    cmd = [
+        "ndlocr-lite",
+        "--sourcedir", str(ndlocr_dir),
+        "--output", str(ndlocr_dir),
+    ]
+    print(f"[INFO] NDLOCR実行: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode != 0:
+            print(f"[ERROR] NDLOCR実行失敗:\n{result.stderr}")
+            return False
+        print(f"[INFO] NDLOCR実行完了")
+        return True
+    except FileNotFoundError:
+        print("[ERROR] ndlocr-liteコマンドが見つかりません。`uv tool install ndlocr-lite` を実行してください。")
+        return False
+
+
+def build_merged_text(
+    ndlocr_dir: Path,
+    output_dir: Path,
+    stem: str,
     title: str | None,
-    source_pdf: str | None,
-) -> None:
+    source_path: str | None,
+) -> tuple[Path, Path, Path] | None:
+    """NDLOCR出力XMLから統合テキスト・ページ索引・閲覧用テキストを生成する。
+
+    Returns:
+        (body_path, index_path, indexed_path) のタプル、または失敗時はNone
+    """
     xml_files = sorted(
-        (p for p in ocr_dir.glob("page_*.xml") if PAGE_FILE_RE.search(p.name)),
+        (p for p in ndlocr_dir.glob("page_*.xml") if PAGE_FILE_RE.search(p.name)),
         key=lambda p: int(PAGE_FILE_RE.search(p.name).group(1)),
     )
     if not xml_files:
-        sys.exit(f"ページXML (page_XXXX.xml) が見つかりません: {ocr_dir}")
+        print(f"[WARN] ページXML (page_XXXX.xml) が見つかりません: {ndlocr_dir}")
+        return None
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    body_path = out_dir / f"{prefix}.ndlocr-body.txt"
-    index_path = out_dir / f"{prefix}.ndlocr-index.json"
-    indexed_path = out_dir / f"{prefix}.ndlocr-indexed.txt"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    body_path = output_dir / f"{stem}_NDLOCR結果（本文のみ結合済）.txt"
+    index_path = output_dir / f"{stem}_NDLOCR結果（ページ索引）.json"
+    indexed_path = output_dir / f"{stem}_NDLOCR結果（閲覧用ページ番号付き）.txt"
 
     body_parts: list[str] = []
     indexed_parts: list[str] = []
@@ -73,9 +158,8 @@ def build(
         assert m is not None
         page_num = int(m.group(1))
         page_entries.append([body_byte_count, page_num])
-        indexed_parts.append(f"<<<PAGE {page_num}>>>\n")
+        indexed_parts.append(f'<page number="{page_num}">\n')
 
-        prev_type_in_body: str | None = None
         for ltype, text in iter_lines_in_reading_order(xml_file):
             if not text:
                 continue
@@ -84,18 +168,17 @@ def build(
                 body_byte_count += len(text.encode("utf-8"))
                 indexed_parts.append(text)
                 indexed_parts.append("\n")
-                prev_type_in_body = ltype
             elif ltype == TYPE_TITLE:
                 # 章境界の疑似改行。body.txt 側は LF を1つだけ挿入
-                # （直前が本文で、かつ末尾が改行でない場合のみ）
                 if body_parts and not body_parts[-1].endswith("\n"):
                     body_parts.append("\n")
                     body_byte_count += 1
                 indexed_parts.append(f"[見出し] {text}\n")
-                prev_type_in_body = None
             else:
                 # キャプション・頭注・割注・広告文字 等は検索対象外
                 pass
+
+        indexed_parts.append("</page>\n")
 
     body_text = "".join(body_parts)
     if not body_text.endswith("\n"):
@@ -103,9 +186,9 @@ def build(
 
     meta = {
         "title": title or "",
-        "source_pdf": source_pdf or "",
+        "source": source_path or "",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "ocr_dir": str(ocr_dir),
+        "ndlocr_dir": str(ndlocr_dir),
         "page_count": len(xml_files),
         "body_bytes": len(body_text.encode("utf-8")),
     }
@@ -117,33 +200,401 @@ def build(
         newline="\n",
     )
     indexed_path.write_text(
-        f"# title     : {meta['title']}\n"
-        f"# source    : {meta['source_pdf']}\n"
-        f"# generated : {meta['generated_at']}\n"
-        f"# pages     : {meta['page_count']}\n\n"
+        f"<!-- title     : {meta['title']} -->\n"
+        f"<!-- source    : {meta['source']} -->\n"
+        f"<!-- generated : {meta['generated_at']} -->\n"
+        f"<!-- pages     : {meta['page_count']} -->\n\n"
         + "".join(indexed_parts),
         encoding="utf-8",
         newline="\n",
     )
 
-    print(f"[OK] {body_path.name:30s}: {body_path}  ({meta['body_bytes']} bytes)")
-    print(f"[OK] {index_path.name:30s}: {index_path}  ({len(page_entries)} pages)")
-    print(f"[OK] {indexed_path.name:30s}: {indexed_path}")
+    print(f"[OK] {body_path.name}: {body_path} ({meta['body_bytes']} bytes)")
+    print(f"[OK] {index_path.name}: {index_path} ({len(page_entries)} pages)")
+    print(f"[OK] {indexed_path.name}: {indexed_path}")
+
+    return body_path, index_path, indexed_path
+
+
+def process_pdf(
+    pdf_path: Path,
+    skip_ocr: bool = False,
+    dpi: int = 300,
+) -> tuple[Path, Path, Path] | None:
+    """PDFを処理する: 画像化 → NDLOCR実行 → 後処理。"""
+    stem = pdf_path.stem
+    parent_dir = pdf_path.parent
+    ndlocr_dir = parent_dir / f"{stem}_NDLOCR"
+
+    # PDF画像化
+    pdf_to_images(pdf_path, ndlocr_dir, dpi)
+
+    # NDLOCR実行
+    if not skip_ocr:
+        if not run_ndlocr(ndlocr_dir):
+            return None
+
+    # 後処理
+    return build_merged_text(
+        ndlocr_dir=ndlocr_dir,
+        output_dir=parent_dir,
+        stem=stem,
+        title=stem,
+        source_path=str(pdf_path),
+    )
+
+
+def process_single_image(
+    image_path: Path,
+    skip_ocr: bool = False,
+) -> tuple[Path, Path, Path] | None:
+    """単一画像を処理する: _NDLOCRディレクトリ作成 → page_001.pngにコピー → NDLOCR実行 → 後処理。"""
+    stem = image_path.stem
+    parent_dir = image_path.parent
+    ndlocr_dir = parent_dir / f"{stem}_NDLOCR"
+    ndlocr_dir.mkdir(parents=True, exist_ok=True)
+
+    # 画像をpage_001.pngとしてコピー
+    dest_path = ndlocr_dir / "page_001.png"
+    if image_path.suffix.lower() in {".png"}:
+        shutil.copy2(image_path, dest_path)
+    else:
+        # PNG以外はPILで変換
+        try:
+            from PIL import Image
+            img = Image.open(image_path)
+            img.save(dest_path, "PNG")
+        except ImportError:
+            # PILがなければそのままコピー（NDLOCRがサポートしていれば動く）
+            shutil.copy2(image_path, ndlocr_dir / f"page_001{image_path.suffix}")
+            dest_path = ndlocr_dir / f"page_001{image_path.suffix}"
+
+    print(f"[INFO] 画像配置完了: {dest_path}")
+
+    # NDLOCR実行
+    if not skip_ocr:
+        if not run_ndlocr(ndlocr_dir):
+            return None
+
+    # 後処理
+    return build_merged_text(
+        ndlocr_dir=ndlocr_dir,
+        output_dir=parent_dir,
+        stem=stem,
+        title=stem,
+        source_path=str(image_path),
+    )
+
+
+def process_image_folder(
+    folder_path: Path,
+    combine: str,
+    order_file: Path | None,
+    skip_ocr: bool = False,
+) -> list[tuple[Path, Path, Path]]:
+    """画像フォルダを処理する: 各画像を独立処理 + オプションで全体結合。"""
+    image_files = sorted([
+        p for p in folder_path.iterdir()
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    ])
+
+    if not image_files:
+        print(f"[WARN] 画像ファイルが見つかりません: {folder_path}")
+        return []
+
+    # custom-order の1回目: テンプレート生成して終了
+    if combine == "custom-order" and order_file is None:
+        template_path = folder_path / f"{folder_path.name}_NDLOCR_ordering_template.txt"
+        lines = [f"{i+1}\t{p.name}" for i, p in enumerate(image_files)]
+        template_content = "\n".join(lines) + "\n"
+        template_path.write_text(template_content, encoding="utf-8", newline="\n")
+        print(f"[INFO] 順序指定テンプレートを生成しました: {template_path}")
+        print("[INFO] テンプレートを編集後、--order-file オプションで指定して再実行してください。")
+        print("\n--- テンプレート内容 ---")
+        print(template_content)
+        return []
+
+    results: list[tuple[Path, Path, Path]] = []
+
+    # 各画像を独立処理
+    for image_path in image_files:
+        result = process_single_image(image_path, skip_ocr=skip_ocr)
+        if result:
+            results.append(result)
+
+    # 全体結合
+    if combine != "none" and results:
+        if combine == "name-order":
+            # ファイル名昇順で連結
+            combine_results(
+                results=results,
+                output_dir=folder_path,
+                stem=folder_path.name,
+            )
+        elif combine == "custom-order" and order_file is not None:
+            # 順序指定ファイルに従って連結
+            ordered_results = reorder_by_order_file(results, order_file, image_files)
+            if ordered_results:
+                combine_results(
+                    results=ordered_results,
+                    output_dir=folder_path,
+                    stem=folder_path.name,
+                )
+
+    return results
+
+
+def reorder_by_order_file(
+    results: list[tuple[Path, Path, Path]],
+    order_file: Path,
+    original_images: list[Path],
+) -> list[tuple[Path, Path, Path]] | None:
+    """順序指定ファイルに従ってresultsを並べ替える。"""
+    order_lines = order_file.read_text(encoding="utf-8").strip().split("\n")
+    order_map: dict[str, int] = {}
+
+    for i, line in enumerate(order_lines):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # 形式: "番号\tファイル名" または "ファイル名"
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            filename = parts[1].strip()
+        else:
+            filename = parts[0].strip()
+        if filename in order_map:
+            print(f"[ERROR] 重複するファイル名: {filename}")
+            return None
+        order_map[filename] = i
+
+    # 結果をファイル名でマップ
+    result_map: dict[str, tuple[Path, Path, Path]] = {}
+    for r in results:
+        # body_pathから元画像名を逆算
+        body_path = r[0]
+        stem = body_path.stem.removesuffix("_NDLOCR結果（本文のみ結合済）")
+        # 元画像ファイルを探す
+        for img in original_images:
+            if img.stem == stem:
+                result_map[img.name] = r
+                break
+
+    # 順序通りに並べ替え
+    ordered_results: list[tuple[Path, Path, Path]] = []
+    for filename in sorted(order_map.keys(), key=lambda f: order_map[f]):
+        if filename not in result_map:
+            print(f"[ERROR] 順序指定ファイルに含まれるが結果が見つからない: {filename}")
+            return None
+        ordered_results.append(result_map[filename])
+
+    # 全ファイルが指定されているか確認
+    if len(ordered_results) != len(results):
+        print(f"[ERROR] 順序指定が不完全です。指定: {len(ordered_results)}, 結果: {len(results)}")
+        return None
+
+    return ordered_results
+
+
+def combine_results(
+    results: list[tuple[Path, Path, Path]],
+    output_dir: Path,
+    stem: str,
+) -> None:
+    """複数の処理結果を結合して全体テキストを生成する。"""
+    combined_body_parts: list[str] = []
+    combined_indexed_parts: list[str] = []
+    combined_pages: list[list[int]] = []
+    body_byte_offset = 0
+    total_page_count = 0
+
+    for body_path, index_path, indexed_path in results:
+        # 本文を読み込み
+        body_text = body_path.read_text(encoding="utf-8")
+        combined_body_parts.append(body_text)
+
+        # ページ索引を読み込み、オフセットを調整
+        index_data = json.loads(index_path.read_text(encoding="utf-8"))
+        for offset, page_num in index_data.get("pages", []):
+            combined_pages.append([body_byte_offset + offset, total_page_count + page_num])
+
+        # 閲覧用テキストを読み込み（ヘッダー部分を除去）
+        indexed_text = indexed_path.read_text(encoding="utf-8")
+        # ヘッダー（<!-- で始まる行）をスキップ
+        lines = indexed_text.split("\n")
+        content_started = False
+        for line in lines:
+            if not content_started:
+                if line.startswith("<!--") or line.strip() == "":
+                    continue
+                content_started = True
+            combined_indexed_parts.append(line + "\n")
+
+        body_byte_offset += len(body_text.encode("utf-8"))
+        page_meta = index_data.get("meta", {})
+        total_page_count += page_meta.get("page_count", 0)
+
+    combined_body = "".join(combined_body_parts)
+    combined_indexed = "".join(combined_indexed_parts)
+
+    # 出力
+    combined_body_path = output_dir / f"{stem}_NDLOCR結果（本文のみ結合済）.txt"
+    combined_index_path = output_dir / f"{stem}_NDLOCR結果（ページ索引）.json"
+    combined_indexed_path = output_dir / f"{stem}_NDLOCR結果（閲覧用ページ番号付き）.txt"
+
+    meta = {
+        "title": stem,
+        "source": str(output_dir),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "combined_from": [str(r[0]) for r in results],
+        "page_count": total_page_count,
+        "body_bytes": len(combined_body.encode("utf-8")),
+    }
+
+    combined_body_path.write_text(combined_body, encoding="utf-8", newline="\n")
+    combined_index_path.write_text(
+        json.dumps({"meta": meta, "pages": combined_pages}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+        newline="\n",
+    )
+    combined_indexed_path.write_text(
+        f"<!-- title     : {meta['title']} -->\n"
+        f"<!-- source    : {meta['source']} -->\n"
+        f"<!-- generated : {meta['generated_at']} -->\n"
+        f"<!-- pages     : {meta['page_count']} -->\n\n"
+        + combined_indexed,
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    print(f"\n[COMBINED] {combined_body_path.name}: {combined_body_path}")
+    print(f"[COMBINED] {combined_index_path.name}: {combined_index_path}")
+    print(f"[COMBINED] {combined_indexed_path.name}: {combined_indexed_path}")
+
+
+def is_pdf(path: Path) -> bool:
+    return path.suffix.lower() == ".pdf"
+
+
+def is_image(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_EXTENSIONS
+
+
+def is_ndlocr_output_dir(path: Path) -> bool:
+    """既存のNDLOCR出力ディレクトリかどうかを判定する。"""
+    if not path.is_dir():
+        return False
+    return any(p.name.startswith("page_") and p.suffix == ".xml" for p in path.iterdir())
+
+
+def process_input(
+    input_path: Path,
+    combine: str,
+    order_file: Path | None,
+    skip_ocr: bool = False,
+    dpi: int = 300,
+) -> list[tuple[Path, Path, Path]]:
+    """入力パスを判定して適切な処理を実行する。"""
+    if not input_path.exists():
+        print(f"[ERROR] パスが存在しません: {input_path}")
+        return []
+
+    if input_path.is_file():
+        if is_pdf(input_path):
+            result = process_pdf(input_path, skip_ocr=skip_ocr, dpi=dpi)
+            return [result] if result else []
+        elif is_image(input_path):
+            result = process_single_image(input_path, skip_ocr=skip_ocr)
+            return [result] if result else []
+        else:
+            print(f"[ERROR] 未対応のファイル形式: {input_path}")
+            return []
+    elif input_path.is_dir():
+        if is_ndlocr_output_dir(input_path):
+            # 既存のNDLOCR出力ディレクトリの場合、後処理のみ実行
+            stem = input_path.name.removesuffix("_NDLOCR")
+            result = build_merged_text(
+                ndlocr_dir=input_path,
+                output_dir=input_path.parent,
+                stem=stem,
+                title=stem,
+                source_path=str(input_path),
+            )
+            return [result] if result else []
+        else:
+            # 画像フォルダとして処理
+            return process_image_folder(input_path, combine, order_file, skip_ocr=skip_ocr)
+    else:
+        print(f"[ERROR] 不明なパス種別: {input_path}")
+        return []
 
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="NDLOCR出力から検索用統合テキスト・ページ索引・閲覧用テキストを生成する。"
+        description="PDF / 画像からNDLOCR実行→後処理まで一貫して実行するオーケストレーター。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+入力パターン:
+  PDFファイル      → 画像化 → NDLOCR実行 → 後処理
+  単一画像ファイル → _NDLOCRディレクトリ作成 → NDLOCR実行 → 後処理
+  画像フォルダ     → 各画像を独立処理 + オプションで全体結合
+  複数ファイル     → 各ファイルを独立処理
+
+出力ファイル:
+  {stem}_NDLOCR結果（本文のみ結合済）.txt       # 検索用本文
+  {stem}_NDLOCR結果（閲覧用ページ番号付き）.txt # <page number="N">...</page>形式
+  {stem}_NDLOCR結果（ページ索引）.json          # バイトオフセット→ページ番号
+  {stem}_NDLOCR/                               # 中間物ディレクトリ
+""",
     )
-    p.add_argument("ocr_dir", type=Path, help="NDLOCR出力ディレクトリ（page_XXXX.xml を含む）")
-    p.add_argument("--out-dir", type=Path, required=True, help="出力先ディレクトリ（自動作成）")
-    p.add_argument("--prefix", type=str, required=True,
-                   help="出力ファイル名のprefix（書籍を識別する任意文字列、"
-                        "例: kokusaiho_2nd）。ファイル名は <prefix>.ndlocr-body.txt 等になる")
-    p.add_argument("--title", type=str, default=None, help="書籍タイトル（メタ情報に記録）")
-    p.add_argument("--source-pdf", type=str, default=None, help="元PDFパス（メタ情報に記録）")
+    p.add_argument(
+        "inputs",
+        type=Path,
+        nargs="+",
+        help="入力ファイル/ディレクトリ（PDF / 画像 / 画像フォルダ / NDLOCR出力ディレクトリ）",
+    )
+    p.add_argument(
+        "--combine",
+        choices=["none", "name-order", "custom-order"],
+        default="none",
+        help="画像フォルダ入力時の全体結合オプション（既定: none）",
+    )
+    p.add_argument(
+        "--order-file",
+        type=Path,
+        default=None,
+        help="custom-order時の順序指定ファイル（1行1ファイル名）",
+    )
+    p.add_argument(
+        "--skip-ocr",
+        action="store_true",
+        help="NDLOCR実行をスキップし、後処理のみ行う（デバッグ用）",
+    )
+    p.add_argument(
+        "--dpi",
+        type=int,
+        default=300,
+        help="PDF画像化時のDPI（既定: 300）",
+    )
     args = p.parse_args()
-    build(args.ocr_dir, args.out_dir, args.prefix, args.title, args.source_pdf)
+
+    all_results: list[tuple[Path, Path, Path]] = []
+
+    for input_path in args.inputs:
+        results = process_input(
+            input_path,
+            combine=args.combine,
+            order_file=args.order_file,
+            skip_ocr=args.skip_ocr,
+            dpi=args.dpi,
+        )
+        all_results.extend(results)
+
+    if not all_results:
+        print("\n[WARN] 処理結果がありません。")
+        sys.exit(1)
+
+    print(f"\n[DONE] 合計 {len(all_results)} 件の処理が完了しました。")
 
 
 if __name__ == "__main__":
