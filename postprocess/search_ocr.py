@@ -1,11 +1,17 @@
-"""build_merged_text.py が生成した body.txt に対して検索を行い、
+"""build_merged_text.py が生成した <prefix>.ndlocr-body.txt に対して検索を行い、
 ヒット箇所の該当ページ番号と前後の文脈を表示する。
 
-page_index.json (バイトオフセット→ページ番号のサイドカー索引) を突き合わせて
-ページ番号を逆引きする。検索は Python の標準ライブラリ ``re`` を用いるため、
-外部コマンド (ripgrep 等) のインストールは不要。
+<prefix>.ndlocr-index.json (バイトオフセット→ページ番号のサイドカー索引) を
+突き合わせてページ番号を逆引きする。検索は Python の標準ライブラリ ``re`` を
+用いるため、外部コマンド (ripgrep 等) のインストールは不要。
+
+対象指定方法:
+  - 第1引数にディレクトリを渡すと、その中の ``*.ndlocr-body.txt`` を自動検出
+    （複数ある場合は ``--prefix`` で明示指定が必要）
+  - 第1引数に ``*.ndlocr-body.txt`` ファイルを直接渡すこともできる
 
 Issue: https://github.com/yukikase0422/ndlocr-lite/issues/1
+      https://github.com/yukikase0422/ndlocr-lite/issues/2
 """
 
 from __future__ import annotations
@@ -56,9 +62,42 @@ def make_context_snippet(body_text: str, char_start: int, char_end: int, context
     return f"{before}【{hit}】{after}".replace("\n", "\\n")
 
 
-def search(out_dir: Path, pattern: str, context: int, ignore_case: bool, fixed_strings: bool) -> int:
-    body_path = out_dir / "body.txt"
-    index_path = out_dir / "page_index.json"
+def resolve_body_and_index(target: Path, prefix: str | None) -> tuple[Path, Path]:
+    """対象指定から body.txt と index.json のパスを確定する。
+
+    - target がファイル: `*.ndlocr-body.txt` とみなし、同所の `*.ndlocr-index.json` を採る
+    - target がディレクトリ: 中の `*.ndlocr-body.txt` を探索。prefix指定があれば `<prefix>.ndlocr-body.txt`
+    """
+    if target.is_file():
+        body_path = target
+        stem = body_path.name.removesuffix(".ndlocr-body.txt")
+        if stem == body_path.name:
+            sys.exit(f"指定ファイルが *.ndlocr-body.txt 形式ではありません: {target}")
+        index_path = body_path.parent / f"{stem}.ndlocr-index.json"
+        return body_path, index_path
+
+    if not target.is_dir():
+        sys.exit(f"ディレクトリまたはファイルが見つかりません: {target}")
+
+    if prefix:
+        body_path = target / f"{prefix}.ndlocr-body.txt"
+        index_path = target / f"{prefix}.ndlocr-index.json"
+        return body_path, index_path
+
+    candidates = sorted(target.glob("*.ndlocr-body.txt"))
+    if len(candidates) == 0:
+        sys.exit(f"*.ndlocr-body.txt が見つかりません: {target}")
+    if len(candidates) > 1:
+        names = ", ".join(p.name for p in candidates)
+        sys.exit(f"複数の *.ndlocr-body.txt が見つかりました。--prefix で指定してください: {names}")
+    body_path = candidates[0]
+    stem = body_path.name.removesuffix(".ndlocr-body.txt")
+    index_path = body_path.parent / f"{stem}.ndlocr-index.json"
+    return body_path, index_path
+
+
+def search(target: Path, prefix: str | None, pattern: str, context: int, ignore_case: bool, fixed_strings: bool) -> int:
+    body_path, index_path = resolve_body_and_index(target, prefix)
     for p in (body_path, index_path):
         if not p.is_file():
             sys.exit(f"必須ファイルが見つかりません: {p}")
@@ -93,13 +132,16 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description="build_merged_text.py の出力に対してページ番号付き検索を行う。"
     )
-    p.add_argument("out_dir", type=Path, help="build_merged_text.py の出力ディレクトリ")
+    p.add_argument("target", type=Path,
+                   help="*.ndlocr-body.txt ファイル、またはそれを含むディレクトリ")
     p.add_argument("pattern", type=str, help="検索パターン（Python re 形式、既定）")
+    p.add_argument("--prefix", type=str, default=None,
+                   help="同一ディレクトリに複数の *.ndlocr-body.txt がある場合にprefixを指定")
     p.add_argument("-c", "--context", type=int, default=30, help="ヒット前後の文脈文字数（既定30）")
     p.add_argument("-i", "--ignore-case", action="store_true", help="大文字小文字を区別しない")
     p.add_argument("-F", "--fixed-strings", action="store_true", help="パターンを正規表現でなくリテラル文字列として扱う")
     args = p.parse_args()
-    sys.exit(search(args.out_dir, args.pattern, args.context, args.ignore_case, args.fixed_strings))
+    sys.exit(search(args.target, args.prefix, args.pattern, args.context, args.ignore_case, args.fixed_strings))
 
 
 if __name__ == "__main__":

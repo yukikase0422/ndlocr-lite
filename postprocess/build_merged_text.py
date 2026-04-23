@@ -1,6 +1,15 @@
 """NDLOCR出力XMLから検索用統合テキスト・ページ索引・閲覧用テキストを生成する。
 
+生成ファイル (出力ディレクトリ直下に配置):
+  - ``<prefix>.ndlocr-body.txt``     検索専用本文
+  - ``<prefix>.ndlocr-index.json``   バイトオフセット→ページ番号索引
+  - ``<prefix>.ndlocr-indexed.txt``  人間閲覧用（ページ/章マーカー入り）
+
+``.ndlocr-*`` サフィックスはNDLOCR後処理結果の一意な識別子として機能し、
+Claude Code等のツールが当該ファイルを自動判別する際に利用する。
+
 Issue: https://github.com/yukikase0422/ndlocr-lite/issues/1
+      https://github.com/yukikase0422/ndlocr-lite/issues/2
 """
 
 from __future__ import annotations
@@ -38,6 +47,7 @@ def iter_lines_in_reading_order(xml_path: Path) -> Iterable[tuple[str, str]]:
 def build(
     ocr_dir: Path,
     out_dir: Path,
+    prefix: str,
     title: str | None,
     source_pdf: str | None,
 ) -> None:
@@ -49,9 +59,9 @@ def build(
         sys.exit(f"ページXML (page_XXXX.xml) が見つかりません: {ocr_dir}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    body_path = out_dir / "body.txt"
-    index_path = out_dir / "page_index.json"
-    indexed_path = out_dir / "indexed.txt"
+    body_path = out_dir / f"{prefix}.ndlocr-body.txt"
+    index_path = out_dir / f"{prefix}.ndlocr-index.json"
+    indexed_path = out_dir / f"{prefix}.ndlocr-indexed.txt"
 
     body_parts: list[str] = []
     indexed_parts: list[str] = []
@@ -116,9 +126,9 @@ def build(
         newline="\n",
     )
 
-    print(f"[OK] body.txt        : {body_path}  ({meta['body_bytes']} bytes)")
-    print(f"[OK] page_index.json : {index_path}  ({len(page_entries)} pages)")
-    print(f"[OK] indexed.txt     : {indexed_path}")
+    print(f"[OK] {body_path.name:30s}: {body_path}  ({meta['body_bytes']} bytes)")
+    print(f"[OK] {index_path.name:30s}: {index_path}  ({len(page_entries)} pages)")
+    print(f"[OK] {indexed_path.name:30s}: {indexed_path}")
 
 
 def main() -> None:
@@ -127,10 +137,13 @@ def main() -> None:
     )
     p.add_argument("ocr_dir", type=Path, help="NDLOCR出力ディレクトリ（page_XXXX.xml を含む）")
     p.add_argument("--out-dir", type=Path, required=True, help="出力先ディレクトリ（自動作成）")
+    p.add_argument("--prefix", type=str, required=True,
+                   help="出力ファイル名のprefix（書籍を識別する任意文字列、"
+                        "例: kokusaiho_2nd）。ファイル名は <prefix>.ndlocr-body.txt 等になる")
     p.add_argument("--title", type=str, default=None, help="書籍タイトル（メタ情報に記録）")
     p.add_argument("--source-pdf", type=str, default=None, help="元PDFパス（メタ情報に記録）")
     args = p.parse_args()
-    build(args.ocr_dir, args.out_dir, args.title, args.source_pdf)
+    build(args.ocr_dir, args.out_dir, args.prefix, args.title, args.source_pdf)
 
 
 if __name__ == "__main__":
