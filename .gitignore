@@ -10,3 +10,6 @@
 /4ab7ecc3-53fb-b3e7-64e8-a809b5a483d2/
 *.egg-info/
 .venv/
+
+# Claude Code user-specific files (not for public repo)
+.claude/user_prompt/
