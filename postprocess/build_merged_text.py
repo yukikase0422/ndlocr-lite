@@ -12,8 +12,14 @@
   - ``{stem}_NDLOCR結果（ページ索引）.json`` — バイトオフセット→ページ番号
   - ``{stem}_NDLOCR/`` — 中間物ディレクトリ（page_XXX.png/txt/xml/json）
 
+中断再開（resume）対応:
+  - 画像化: 既存PNG（サイズ > 0）があればスキップ
+  - OCR: 全ページの .xml/.txt/.json が揃っていればスキップ、未処理があれば全量実行
+  - 集約: 常に中間物から再生成（上書き）
+
 Issue: https://github.com/yukikase0422/ndlocr-lite/issues/1
       https://github.com/yukikase0422/ndlocr-lite/issues/2
+      https://github.com/yukikase0422/ndlocr-lite/issues/4
 """
 
 from __future__ import annotations
@@ -67,8 +73,18 @@ def calculate_zero_padding(total_pages: int) -> int:
     return max(3, len(str(total_pages)))
 
 
-def pdf_to_images(pdf_path: Path, output_dir: Path, dpi: int = 300) -> list[Path]:
-    """PDFを画像に変換し、output_dir内にpage_XXX.pngとして保存する。"""
+def pdf_to_images(
+    pdf_path: Path,
+    output_dir: Path,
+    dpi: int = 300,
+    force_rerender: bool = False,
+) -> list[Path]:
+    """PDFを画像に変換し、output_dir内にpage_XXX.pngとして保存する。
+
+    中断再開対応:
+      - 既存の page_N.png が存在しサイズ > 0 ならスキップ
+      - force_rerender=True なら既存ファイルを無視して全ページ再生成
+    """
     try:
         import pypdfium2 as pdfium
     except ImportError:
@@ -82,23 +98,76 @@ def pdf_to_images(pdf_path: Path, output_dir: Path, dpi: int = 300) -> list[Path
 
     image_paths: list[Path] = []
     scale = dpi / 72  # 72 DPI is the default PDF unit
+    new_count = 0
+    skip_count = 0
 
     for i, page in enumerate(pdf):
         page_num = i + 1
+        output_path = output_dir / f"page_{page_num:0{zero_pad}d}.png"
+
+        # 既存ファイルチェック（サイズ > 0）
+        if not force_rerender and output_path.exists() and output_path.stat().st_size > 0:
+            skip_count += 1
+            image_paths.append(output_path)
+            page.close()
+            continue
+
+        # 新規レンダリング
         bitmap = page.render(scale=scale)
         pil_image = bitmap.to_pil()
-        output_path = output_dir / f"page_{page_num:0{zero_pad}d}.png"
         pil_image.save(str(output_path), "PNG")
         image_paths.append(output_path)
+        new_count += 1
         page.close()
 
     pdf.close()
-    print(f"[INFO] PDF画像化完了: {total_pages}ページ → {output_dir}")
+    print(f"[INFO] PDF画像化: 新規 {new_count}ページ / スキップ {skip_count}ページ / 合計 {total_pages}ページ")
     return image_paths
 
 
-def run_ndlocr(ndlocr_dir: Path) -> bool:
-    """NDLOCRを実行する。ndlocr_dir内のpage_XXX.pngを処理する。"""
+def _is_page_ocr_complete(ndlocr_dir: Path, png_path: Path) -> bool:
+    """当該PNGのOCR結果（.xml/.txt/.json）が揃っているかを判定する。
+
+    判定条件: page_N.xml / page_N.json がサイズ > 0 で存在、page_N.txt は存在。
+    （.txt はNDLOCRで空出力のページが正常にあり得るためサイズ条件を緩める）
+    """
+    stem = png_path.stem  # "page_001"
+    xml_p = ndlocr_dir / f"{stem}.xml"
+    txt_p = ndlocr_dir / f"{stem}.txt"
+    json_p = ndlocr_dir / f"{stem}.json"
+    return (
+        xml_p.is_file() and xml_p.stat().st_size > 0
+        and txt_p.is_file()
+        and json_p.is_file() and json_p.stat().st_size > 0
+    )
+
+
+def run_ndlocr(ndlocr_dir: Path, force_reocr: bool = False) -> bool:
+    """NDLOCRを実行する。ndlocr_dir内のpage_XXX.pngを処理する。
+
+    中断再開対応（案1: 全量実行で本家に任せる方式）:
+      - ndlocr_dir内の全page_*.pngについて、対応する.xml/.txt/.jsonが既に揃っていれば
+        NDLOCR呼び出しをスキップ（既処理とみなす）
+      - 一部でも未処理があれば全量実行する（NDLOCR本家は既存出力を上書きする挙動）
+      - force_reocr=True なら既存出力を無視して全量実行
+    """
+    png_files = sorted(ndlocr_dir.glob("page_*.png"))
+    if not png_files:
+        print(f"[WARN] page_*.pngが見つかりません: {ndlocr_dir}")
+        return False
+
+    total = len(png_files)
+    if not force_reocr:
+        completed = [p for p in png_files if _is_page_ocr_complete(ndlocr_dir, p)]
+        if len(completed) == total:
+            print(f"[INFO] NDLOCR: 全{total}ページのOCR結果が既に揃っています。スキップします。")
+            return True
+        pending_count = total - len(completed)
+        print(f"[INFO] NDLOCR: 未処理 {pending_count}ページ / 既存 {len(completed)}ページ / 合計 {total}ページ")
+        print(f"[INFO] 案1方針により全量実行します（既存出力は本家側で上書きされます）")
+    else:
+        print(f"[INFO] NDLOCR: --force-reocr 指定により全{total}ページ強制再実行")
+
     cmd = [
         "ndlocr-lite",
         "--sourcedir", str(ndlocr_dir),
@@ -220,21 +289,23 @@ def process_pdf(
     pdf_path: Path,
     skip_ocr: bool = False,
     dpi: int = 300,
+    force_rerender: bool = False,
+    force_reocr: bool = False,
 ) -> tuple[Path, Path, Path] | None:
     """PDFを処理する: 画像化 → NDLOCR実行 → 後処理。"""
     stem = pdf_path.stem
     parent_dir = pdf_path.parent
     ndlocr_dir = parent_dir / f"{stem}_NDLOCR"
 
-    # PDF画像化
-    pdf_to_images(pdf_path, ndlocr_dir, dpi)
+    # PDF画像化（resume対応）
+    pdf_to_images(pdf_path, ndlocr_dir, dpi, force_rerender=force_rerender)
 
-    # NDLOCR実行
+    # NDLOCR実行（resume対応）
     if not skip_ocr:
-        if not run_ndlocr(ndlocr_dir):
+        if not run_ndlocr(ndlocr_dir, force_reocr=force_reocr):
             return None
 
-    # 後処理
+    # 後処理（常に再生成）
     return build_merged_text(
         ndlocr_dir=ndlocr_dir,
         output_dir=parent_dir,
@@ -247,6 +318,7 @@ def process_pdf(
 def process_single_image(
     image_path: Path,
     skip_ocr: bool = False,
+    force_reocr: bool = False,
 ) -> tuple[Path, Path, Path] | None:
     """単一画像を処理する: _NDLOCRディレクトリ作成 → page_001.pngにコピー → NDLOCR実行 → 後処理。"""
     stem = image_path.stem
@@ -271,12 +343,12 @@ def process_single_image(
 
     print(f"[INFO] 画像配置完了: {dest_path}")
 
-    # NDLOCR実行
+    # NDLOCR実行（resume対応）
     if not skip_ocr:
-        if not run_ndlocr(ndlocr_dir):
+        if not run_ndlocr(ndlocr_dir, force_reocr=force_reocr):
             return None
 
-    # 後処理
+    # 後処理（常に再生成）
     return build_merged_text(
         ndlocr_dir=ndlocr_dir,
         output_dir=parent_dir,
@@ -291,6 +363,7 @@ def process_image_folder(
     combine: str,
     order_file: Path | None,
     skip_ocr: bool = False,
+    force_reocr: bool = False,
 ) -> list[tuple[Path, Path, Path]]:
     """画像フォルダを処理する: 各画像を独立処理 + オプションで全体結合。"""
     image_files = sorted([
@@ -318,7 +391,7 @@ def process_image_folder(
 
     # 各画像を独立処理
     for image_path in image_files:
-        result = process_single_image(image_path, skip_ocr=skip_ocr)
+        result = process_single_image(image_path, skip_ocr=skip_ocr, force_reocr=force_reocr)
         if result:
             results.append(result)
 
@@ -493,6 +566,8 @@ def process_input(
     order_file: Path | None,
     skip_ocr: bool = False,
     dpi: int = 300,
+    force_rerender: bool = False,
+    force_reocr: bool = False,
 ) -> list[tuple[Path, Path, Path]]:
     """入力パスを判定して適切な処理を実行する。"""
     if not input_path.exists():
@@ -501,10 +576,20 @@ def process_input(
 
     if input_path.is_file():
         if is_pdf(input_path):
-            result = process_pdf(input_path, skip_ocr=skip_ocr, dpi=dpi)
+            result = process_pdf(
+                input_path,
+                skip_ocr=skip_ocr,
+                dpi=dpi,
+                force_rerender=force_rerender,
+                force_reocr=force_reocr,
+            )
             return [result] if result else []
         elif is_image(input_path):
-            result = process_single_image(input_path, skip_ocr=skip_ocr)
+            result = process_single_image(
+                input_path,
+                skip_ocr=skip_ocr,
+                force_reocr=force_reocr,
+            )
             return [result] if result else []
         else:
             print(f"[ERROR] 未対応のファイル形式: {input_path}")
@@ -512,6 +597,7 @@ def process_input(
     elif input_path.is_dir():
         if is_ndlocr_output_dir(input_path):
             # 既存のNDLOCR出力ディレクトリの場合、後処理のみ実行
+            # （集約は常に再生成 = resume設計の集約フェーズに該当）
             stem = input_path.name.removesuffix("_NDLOCR")
             result = build_merged_text(
                 ndlocr_dir=input_path,
@@ -523,7 +609,13 @@ def process_input(
             return [result] if result else []
         else:
             # 画像フォルダとして処理
-            return process_image_folder(input_path, combine, order_file, skip_ocr=skip_ocr)
+            return process_image_folder(
+                input_path,
+                combine,
+                order_file,
+                skip_ocr=skip_ocr,
+                force_reocr=force_reocr,
+            )
     else:
         print(f"[ERROR] 不明なパス種別: {input_path}")
         return []
@@ -568,13 +660,23 @@ def main() -> None:
     p.add_argument(
         "--skip-ocr",
         action="store_true",
-        help="NDLOCR実行をスキップし、後処理のみ行う（デバッグ用）",
+        help="NDLOCR実行をスキップし、後処理のみ行う（デバッグ・集約のみ再生成用）",
     )
     p.add_argument(
         "--dpi",
         type=int,
         default=300,
         help="PDF画像化時のDPI（既定: 300）",
+    )
+    p.add_argument(
+        "--force-rerender",
+        action="store_true",
+        help="PDF画像化を強制再実行（既存page_N.pngを無視）",
+    )
+    p.add_argument(
+        "--force-reocr",
+        action="store_true",
+        help="NDLOCR実行を強制再実行（既存page_N.xml/txt/jsonを無視）",
     )
     args = p.parse_args()
 
@@ -587,6 +689,8 @@ def main() -> None:
             order_file=args.order_file,
             skip_ocr=args.skip_ocr,
             dpi=args.dpi,
+            force_rerender=args.force_rerender,
+            force_reocr=args.force_reocr,
         )
         all_results.extend(results)
 
