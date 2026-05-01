@@ -192,6 +192,30 @@ def run_ndlocr(ndlocr_dir: Path, force_reocr: bool = False) -> bool:
         return False
 
 
+def cleanup_intermediate_pngs(ndlocr_dir: Path) -> int:
+    """NDLOCR中間物ディレクトリ内の page_*.png を削除する。
+
+    OCR結果（.xml/.txt/.json）と後処理結果（_NDLOCR結果...txt 等）が生成済みであれば
+    PNGは以後の検索・閲覧・再集約のいずれにも不要であるため削除する。
+    再OCRが必要な場合は、PDFや単一画像・画像フォルダといった元入力から再レンダリングできる。
+
+    Returns:
+        実際に削除できたファイル数。
+    """
+    if not ndlocr_dir.is_dir():
+        return 0
+    deleted = 0
+    for png in ndlocr_dir.glob("page_*.png"):
+        try:
+            png.unlink()
+            deleted += 1
+        except Exception as e:
+            print(f"[WARN] 中間画像の削除に失敗 ({png.name}): {e}")
+    if deleted > 0:
+        print(f"[INFO] OCR用中間画像 {deleted}件 を削除しました: {ndlocr_dir}")
+    return deleted
+
+
 def build_merged_text(
     ndlocr_dir: Path,
     output_dir: Path,
@@ -281,6 +305,8 @@ def build_merged_text(
     print(f"[OK] {body_path.name}: {body_path} ({meta['body_bytes']} bytes)")
     print(f"[OK] {index_path.name}: {index_path} ({len(page_entries)} pages)")
     print(f"[OK] {indexed_path.name}: {indexed_path}")
+
+    cleanup_intermediate_pngs(ndlocr_dir)
 
     return body_path, index_path, indexed_path
 
